@@ -1,0 +1,48 @@
+# Standardized Configuration for Deepfake Watermarking Framework
+project_name: "Deepfake-Watermarking-Universal"
+experiment_id: "main_run"
+
+path_config:
+  raw_path: "data/raw/celeba"
+  processed_path: "data/processed"
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  identity_file: "data/raw/celeba/identity_CelebA.txt"
+  landmarks_file: "data/raw/celeba/list_landmarks_celeba.txt"
+
+data_config:
+  target_train: 100
+  target_val: 10
+  target_test: 10
+  image_size: 128
+  batch_size: 4
+  num_workers: 1
+  ablation_region: "full"
+  limit_samples: null
+
+model_config:
+  watermark_length: 64       # Secret key length
+  n_bits: 80                 # Encoded payload size (with BCH)
+  discriminator_ndf: 64      # Base filters for PatchGAN
+  adversary_base_filters: 32 # Base filters for U-Net Intruder
+  adversary_epsilon: 0.1     # Max attack strength (L-inf bound)
+  preprocessing_quality: 95  # JPEG export quality
+
+training_config:
+  device: "cpu"           # Centralized hardware string
+  epochs: 1
+  lr: 2.0e-4                 # 2e-4
+  disc_lr_mult: 0.5
+  betas: [0.5, 0.9]
+  log_freq: 10
+  save_freq: 5
+
+loss_config:
+  lambda_l1: 1.0
+  lambda_lpips: 2.0
+  lambda_ssim: 0.5
+  lambda_id: 1.5             # Identity facial geometry protection
+  lambda_bit_benign: 2.0     # Compression survival (JPEG)
+  lambda_bit_fragile: 1.0    # Identity deepfake swapping detection
+  lambda_disc: 0.1           # PatchGAN Stealth 
+  lambda_adv: 1.0            # Resilience against UNet Intruder
