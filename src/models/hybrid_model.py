@@ -143,15 +143,12 @@ class SpatialDecoder(nn.Module):
             ResBlock(256),
             
             nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 512),
-            nn.ReLU(),
-            ResBlock(512),
-            nn.AdaptiveAvgPool2d((1, 1))
+            nn.AdaptiveAvgPool2d((4, 4))
         )
         
     def forward(self, img):
         x = self.net(img)
-        return x.view(x.size(0), -1)
+        return x
 
 class FrequencyDecoder(nn.Module):
     """
@@ -176,10 +173,7 @@ class FrequencyDecoder(nn.Module):
             
             # [B, 512, 16, 16] -> [B, 512, 8, 8]
             nn.Conv2d(512, 512, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 512),
-            nn.ReLU(),
-            ResBlock(512),
-            nn.AdaptiveAvgPool2d((1, 1))
+            nn.AdaptiveAvgPool2d((4, 4))
         )
         
     def forward(self, img):
@@ -191,24 +185,32 @@ class FrequencyDecoder(nn.Module):
         x_reshaped = x_reshaped.permute(0, 1, 3, 5, 2, 4).contiguous().view(B, 192, H//8, W//8)
         
         x = self.net(x_reshaped)
-        return x.view(x.size(0), -1)
+        return x
 
 class HybridDecoder(nn.Module):
     def __init__(self, n_bits):
         super().__init__()
-        self.spatial_decoder = SpatialDecoder(n_bits=n_bits)
         self.freq_decoder = FrequencyDecoder(n_bits=n_bits)
         
-        # SOTA Feature Fusion: Global Average Pooling outputs 512 features per domain
-        # Combine 1024 raw features into a stable 512 hidden layer
-        self.fusion_fc = nn.Sequential(
-            nn.Linear(512 * 2, 512),
+        # SOTA Feature Fusion: Fully Convolutional Decoder
+        # Preserves spatial features, evaluates bits locally via 1x1 convs, 
+        # then mathematically averages the bit predictions (mean(f(x)) instead of f(mean(x)))
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(1024, 512, kernel_size=1),
             nn.ReLU(inplace=True),
-            nn.Linear(512, n_bits)
+            nn.Conv2d(512, n_bits, kernel_size=1),
+            nn.AdaptiveAvgPool2d((1, 1))
         )
         
     def forward(self, img):
-        s_bits = self.spatial_decoder(img)
-        f_bits = self.freq_decoder(img)
-        out = self.fusion_fc(torch.cat([s_bits, f_bits], dim=1))
+        s_feat = self.spatial_decoder(img) # [B, 512, 4, 4]
+        f_feat = self.freq_decoder(img)    # [B, 512, 4, 4]
+        
+        # Concatenate along channel dimension
+        cat_feat = torch.cat([s_feat, f_feat], dim=1) # [B, 1024, 4, 4]
+        
+        # Fully convolutional bit prediction
+        out = self.fusion_conv(cat_feat) # [B, n_bits, 1, 1]
+        out = out.view(out.size(0), -1)  # [B, n_bits]
+        
         return torch.sigmoid(out)
