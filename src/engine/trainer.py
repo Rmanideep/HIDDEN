@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import random
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
@@ -11,11 +12,11 @@ import lpips
 from facenet_pytorch import InceptionResnetV1
 import kornia.metrics as K_metrics
 import kornia.losses as K_losses
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from models.hybrid_model import HybridEncoder, HybridDecoder
-from models.adversarial import WassersteinCritic, AdversaryNet
-from core.math import encode_message_bch, decode_message_bch, FunctionalBlockCodec
-from core.attacks import BenignAugmentationPipeline, MalignAttackGenerator
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from src.models.hybrid_model import HybridEncoder, HybridDecoder
+from src.models.adversarial import WassersteinCritic, AdversaryNet
+from src.engine.math import encode_message_bch, decode_message_bch, FunctionalBlockCodec
+from src.attacks.attacks import BenignAugmentationPipeline, MalignAttackGenerator
 
 
 class WatermarkLoss(nn.Module):
@@ -90,7 +91,7 @@ class WatermarkLoss(nn.Module):
         return F.mse_loss(feat1, feat2)
 
     def forward(self, I, I_w, msg_encoded,
-                msg_pred_benign, msg_pred_attacked,
+                msg_pred_benign, msg_pred_attacked=None,
                 disc_pred_fake=None, msg_pred_adv=None):
         """
         Computes the full 8-component loss.
@@ -136,7 +137,9 @@ class WatermarkLoss(nn.Module):
             metrics['bit_benign'] = loss_bit_benign.item()
 
             # 6. Fragile Bit Loss - Force bit destruction after deepfake attack
-            loss_bit_fragile = self.bce(msg_pred_attacked.float(), (1.0 - msg_encoded).float())
+            loss_bit_fragile = torch.tensor(0.0, device=self.device)
+            if msg_pred_attacked is not None:
+                loss_bit_fragile = self.bce(msg_pred_attacked.float(), (1.0 - msg_encoded).float())
             metrics['bit_fragile'] = loss_bit_fragile.item()
 
         # ===================== ADVERSARIAL =====================
@@ -249,11 +252,19 @@ class WatermarkTrainer:
             lr=lr, betas=betas
         )
 
-        # --- LR Scheduling (Stability) ---
-        epochs = config['training_config']['epochs']
-        self.scheduler_encdec = CosineAnnealingLR(self.opt_encdec, T_max=epochs)
-        self.scheduler_disc = CosineAnnealingLR(self.opt_disc, T_max=epochs)
-        self.scheduler_adv = CosineAnnealingLR(self.opt_adv, T_max=epochs)
+        # --- LR Scheduling (Plateau-based, not timer-based) ---
+        # ReduceLROnPlateau only decays LR when BER stops improving,
+        # unlike CosineAnnealingLR which was decaying during Phase 1 and
+        # actively fighting the curriculum.
+        self.scheduler_encdec = ReduceLROnPlateau(
+            self.opt_encdec, mode='min', factor=0.3, patience=12, min_lr=1e-6, verbose=True
+        )
+        self.scheduler_disc = ReduceLROnPlateau(
+            self.opt_disc, mode='min', factor=0.3, patience=12, min_lr=1e-6, verbose=True
+        )
+        self.scheduler_adv = ReduceLROnPlateau(
+            self.opt_adv, mode='min', factor=0.3, patience=12, min_lr=1e-6, verbose=True
+        )
 
         # Read lambda_gp from config
         self.lambda_gp = config['loss_config'].get('lambda_gp', 10.0)
@@ -277,6 +288,9 @@ class WatermarkTrainer:
         self.accumulation_steps = tc.get('accumulation_steps', 1)
         self.eval_freq = tc.get('eval_freq', 1)
         self.max_eval_steps = tc.get('max_eval_steps', None)
+
+        # --- Augmentation Probability (set by train.py curriculum) ---
+        self.aug_prob = 0.0  # 0.0 = no augmentations, 1.0 = always augment
 
     # =====================================================================
     # WGAN-GP: GRADIENT PENALTY COMPUTATION
@@ -352,7 +366,7 @@ class WatermarkTrainer:
             if params is not None:
                 # Unscale prior to clipping to ensure true gradient magnitudes are used
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(params, max_norm=5.0)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
@@ -458,23 +472,29 @@ class WatermarkTrainer:
             I_w = self.encoder(I, M, msg_encoded)
 
             # --- Benign Path (Robustness) ---
-            # Skip heavy augmentations in early epochs to let decoder learn clean signal
-            if epoch <= 5:
-                pred_benign = self.decoder(I_w)
-            else:
+            # Augmentation probability controlled by curriculum (train.py sets self.aug_prob)
+            if self.aug_prob > 0 and random.random() < self.aug_prob:
                 benign_w = self.benign_pipeline(I_w)
                 pred_benign = self.decoder(benign_w)
+            else:
+                pred_benign = self.decoder(I_w)
 
-            # --- Malign Path (Fragility) ---
-            attacked_w = self.malign_attack(I_w, I_donor, M)
-            pred_attacked = self.decoder(attacked_w)
+            # --- Malign Path (Fragility) --- GATED: skip when weight is 0
+            pred_attacked = None
+            if self.criterion.W_BIT_FRAGILE > 0:
+                attacked_w = self.malign_attack(I_w, I_donor, M)
+                pred_attacked = self.decoder(attacked_w)
 
-            # --- Discriminator Signal (Realism) ---
-            disc_pred_fake = self.discriminator(I_w)
+            # --- Discriminator Signal (Realism) --- GATED: skip when weight is 0
+            disc_pred_fake = None
+            if self.criterion.W_DISC > 0:
+                disc_pred_fake = self.discriminator(I_w)
 
-            # --- Adversary Signal (Resilience) ---
-            img_adv = self.adversary(I_w)
-            pred_adv = self.decoder(img_adv)
+            # --- Adversary Signal (Resilience) --- GATED: skip when weight is 0
+            pred_adv = None
+            if self.criterion.W_ADV > 0:
+                img_adv = self.adversary(I_w)
+                pred_adv = self.decoder(img_adv)
 
             # --- Compute Full 8-Component Loss ---
             total_loss, metrics = self.criterion(
@@ -482,6 +502,11 @@ class WatermarkTrainer:
                 pred_benign, pred_attacked,
                 disc_pred_fake, pred_adv
             )
+
+        # --- Decoder Output Diagnostics ---
+        with torch.no_grad():
+            metrics['dec_mean'] = pred_benign.mean().item()
+            metrics['dec_std'] = pred_benign.std().item()
 
         params_encdec = list(self.encoder.parameters()) + list(self.decoder.parameters())
         self._step_optimizer(self.opt_encdec, self.scaler_encdec, total_loss, is_last, params=params_encdec)
@@ -512,18 +537,22 @@ class WatermarkTrainer:
             is_last = (i + 1) % self.accumulation_steps == 0 or (i + 1) == len(self.train_loader)
 
             # ============================================
-            # STEP 1: Train Wasserstein Critic
+            # STEP 1: Train Wasserstein Critic -- GATED
             # ============================================
-            with torch.no_grad():
-                img_w_for_disc = self.encoder(I, M, msg_encoded)
-            loss_d, loss_w, loss_gp = self._train_discriminator(I, img_w_for_disc, is_last=is_last)
+            loss_d, loss_w, loss_gp = 0.0, 0.0, 0.0
+            if self.criterion.W_DISC > 0:
+                with torch.no_grad():
+                    img_w_for_disc = self.encoder(I, M, msg_encoded)
+                loss_d, loss_w, loss_gp = self._train_discriminator(I, img_w_for_disc, is_last=is_last)
 
             # ============================================
-            # STEP 2: Train Adversary
+            # STEP 2: Train Adversary -- GATED
             # ============================================
-            with autocast():
-                img_w_for_adv = self.encoder(I, M, msg_encoded)
-            loss_a = self._train_adversary(img_w_for_adv, msg_encoded, is_last=is_last)
+            loss_a = 0.0
+            if self.criterion.W_ADV > 0:
+                with autocast():
+                    img_w_for_adv = self.encoder(I, M, msg_encoded)
+                loss_a = self._train_adversary(img_w_for_adv, msg_encoded, is_last=is_last)
 
             # ============================================
             # STEP 3: Train Encoder-Decoder (Generator)
@@ -546,7 +575,8 @@ class WatermarkTrainer:
                     f"L1: {metrics['l1']:.4f} | "
                     f"LPIPS: {metrics['lpips']:.4f} | "
                     f"BER_b: {metrics['bit_benign']:.4f} | "
-                    f"BER_adv: {metrics['adv']:.4f}"
+                    f"BER_adv: {metrics['adv']:.4f} | "
+                    f"Dec: mu={metrics.get('dec_mean', 0):.3f} sig={metrics.get('dec_std', 0):.3f}"
                 )
                 # TensorBoard -- float() safely converts to Python scalar
                 self.writer.add_scalar('Train/Generator_Total', float(metrics['total']), global_step)
@@ -557,10 +587,8 @@ class WatermarkTrainer:
                 for key, val in metrics.items():
                     self.writer.add_scalar(f'Train/Loss_{key}', float(val), global_step)
 
-        # --- Learning Rate Annealing ---
-        self.scheduler_encdec.step()
-        self.scheduler_disc.step()
-        self.scheduler_adv.step()
+        # --- LR scheduling is driven by val BER, called from train.py eval block ---
+        # (ReduceLROnPlateau.step() requires the monitored metric — called in train.py)
 
     # =====================================================================
     # EVALUATION LOOP
@@ -593,15 +621,33 @@ class WatermarkTrainer:
 
             with autocast():
                 I_w = self.encoder(I, M, msg_encoded)
-                benign_w = self.benign_pipeline(I_w)
-                attacked_w = self.malign_attack(I_w, I_donor, M)
-                img_adv = self.adversary(I_w)
+                # Match training condition: only augment if aug_prob > 0
+                if self.aug_prob > 0:
+                    benign_w = self.benign_pipeline(I_w)
+                else:
+                    benign_w = I_w  # Clean eval during Phase 1 (matches training)
 
                 pred_benign = self.decoder(benign_w)
-                pred_attacked = self.decoder(attacked_w)
-                pred_adv = self.decoder(img_adv)
 
-                # Perceptual metrics
+                # Gate malign path -- only run if fragile loss is active
+                pred_attacked = None
+                if self.criterion.W_BIT_FRAGILE > 0:
+                    attacked_w = self.malign_attack(I_w, I_donor, M)
+                    pred_attacked = self.decoder(attacked_w)
+                else:
+                    # Placeholder: random chance (untrained path)
+                    pred_attacked = torch.empty_like(pred_benign).fill_(0.5)
+
+                # Gate adversary path -- only run if adv loss is active
+                pred_adv = None
+                if self.criterion.W_ADV > 0:
+                    img_adv = self.adversary(I_w)
+                    pred_adv = self.decoder(img_adv)
+                else:
+                    # Placeholder: random chance (untrained path)
+                    pred_adv = torch.empty_like(pred_benign).fill_(0.5)
+
+                # Perceptual metrics (always computed for logging)
                 loss_lpips = self.criterion.lpips_vgg((I * 2.0) - 1.0, (I_w * 2.0) - 1.0).mean()
                 loss_id = self.criterion.get_identity_mse(I, I_w)
 

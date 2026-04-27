@@ -7,7 +7,7 @@ from PIL import Image, ImageFilter
 import random
 import kornia.augmentation as K
 import kornia.filters as F_kornia
-from core.math import DiffJPEG
+from src.engine.math import DiffJPEG
 
 class BenignAugmentationPipeline(nn.Module):
     """
@@ -58,13 +58,14 @@ class BenignAugmentationPipeline(nn.Module):
     def forward(self, I_w):
         img = I_w.clone()
         
-        # 30% odds per transform
-        if random.random() < 0.3:
-            img = self.rotate(img)
-        if random.random() < 0.3:
-            img = self.center_crop_and_resize(img, scale=0.75)
-        if random.random() < 0.3:
-            img = self.hflip(img)
+        # Geometric distortions disabled! Simple CNN decoders without STN
+        # cannot survive arbitrary spatial grids or flipped bit sequences.
+        # if random.random() < 0.3:
+        #     img = self.rotate(img)
+        # if random.random() < 0.3:
+        #     img = self.center_crop_and_resize(img, scale=0.75)
+        # if random.random() < 0.3:
+        #     img = self.hflip(img)
             
         p_filter = random.random()
         if p_filter < 0.1:

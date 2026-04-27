@@ -2,8 +2,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from core.math import BlockDCT, BlockIDCT
-from models.utils import ResBlock
+from src.engine.math import BlockDCT, BlockIDCT
+from src.models.utils import ResBlock
 
 class SpatialEncoder(nn.Module):
     """
@@ -81,7 +81,7 @@ class FrequencyEncoder(nn.Module):
         return freq_out - img
 
 class HybridEncoder(nn.Module):
-    def __init__(self, n_bits, encoder_scale=0.2):
+    def __init__(self, n_bits, encoder_scale=1.0):
         """
         encoder_scale: controls bit capacity vs invisibility tradeoff.
         """
@@ -106,13 +106,19 @@ class HybridEncoder(nn.Module):
         # Non-linear fusion of both residual streams
         fused_res = self.fusion(torch.cat([res_s, res_f], dim=1))
 
-        # Scale is now config-driven, not hardcoded
-        return img + (self.encoder_scale * fused_res)
+        # MATHEMATICAL GUARANTEE: Watermark only exists inside the facial landmarks.
+        # This resolves the Fragility constraint logic error where frequency leaks into background.
+        fused_res = fused_res * M
+
+        # tanh bounds fused_res to [-1, 1], so max pixel change = encoder_scale
+        # clamp(0,1) ensures output is a valid image — fixes the -18dB PSNR disaster
+        return torch.clamp(img + self.encoder_scale * torch.tanh(fused_res), 0.0, 1.0)
 
 class SpatialDecoder(nn.Module):
     """
     Decodes bits from spatial domain.
     Uses GroupNorm for WGAN-GP compatibility.
+    Deepened to 4 strided layers + ResBlocks + 4x4 spatial preservation.
     """
     def __init__(self, n_bits):
         super().__init__()
@@ -120,35 +126,63 @@ class SpatialDecoder(nn.Module):
             nn.Conv2d(3, 64, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(8, 64),
             nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.ReLU(),
+            ResBlock(64),
+            
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(8, 128),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1))
+            ResBlock(128),
+            
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, 256),
+            nn.ReLU(),
+            ResBlock(256),
+            
+            nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, 512),
+            nn.ReLU(),
+            ResBlock(512),
+            
+            nn.AdaptiveAvgPool2d((4, 4))
         )
-        self.fc = nn.Linear(128, n_bits)
+        self.fc = nn.Linear(512 * 4 * 4, n_bits)
         
     def forward(self, img):
         x = self.net(img)
         return self.fc(x.view(x.size(0), -1))
 
 class FrequencyDecoder(nn.Module):
+    """
+    Decodes bits from frequency domain (DCT block AC coefficients).
+    Deepened to 4 strided layers + ResBlocks + 4x4 spatial preservation.
+    """
     def __init__(self, n_bits):
         super().__init__()
         self.dct = BlockDCT(block_size=8)
         self.net = nn.Sequential(
             nn.Conv2d(3, 64, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, 64),
             nn.ReLU(),
+            ResBlock(64),
+            
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, 128),
             nn.ReLU(),
-            # Increased complexity to help with bit recovery
-            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1),
+            ResBlock(128),
+            
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, 256),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1))
+            ResBlock(256),
+            
+            nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, 512),
+            nn.ReLU(),
+            ResBlock(512),
+            
+            nn.AdaptiveAvgPool2d((4, 4))
         )
-        self.fc = nn.Linear(128, n_bits)
+        self.fc = nn.Linear(512 * 4 * 4, n_bits)
         
     def forward(self, img):
         dct_coeffs = self.dct(img)

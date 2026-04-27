@@ -121,50 +121,60 @@ class DiffJPEG(nn.Module):
 
 class FunctionalBlockCodec:
     """
-    Linear Block Code.
+    Linear Block Code. Supports identity mode when k==n (no parity bits).
     """
     def __init__(self, k, n, device='cpu'):
         self.k = k
         self.n = n
         self.parity_len = n - k
-        
-        # Deterministic Parity Matrix
-        np.random.seed(42)
-        P_np = np.random.randint(0, 2, (k, self.parity_len)).astype(np.float32)
-        self.P = torch.tensor(P_np, device=device)
-        
-        I_k = torch.eye(k, device=device)
-        self.G = torch.cat([I_k, self.P], dim=1) # (k, n)
-        
-        I_p = torch.eye(self.parity_len, device=device)
-        self.H = torch.cat([self.P.T, I_p], dim=1) # (parity_len, n)
-        
-        # Syndrome Mapping
-        self.syndrome_table = {}
-        for err_index in range(n):
-            e = torch.zeros(n, device=device)
-            e[err_index] = 1.0
-            s = torch.matmul(e, self.H.T) % 2
-            s_hash = "".join(map(str, s.int().tolist()))
-            self.syndrome_table[s_hash] = err_index
+        self.identity_mode = (n == k)
+
+        if self.identity_mode:
+            # k==n: codec is pure identity, no parity
+            self.G = torch.eye(k, device=device)
+            self.H = torch.zeros(0, n, device=device)
+            self.syndrome_table = {}
+        else:
+            # Deterministic Parity Matrix
+            np.random.seed(42)
+            P_np = np.random.randint(0, 2, (k, self.parity_len)).astype(np.float32)
+            self.P = torch.tensor(P_np, device=device)
+
+            I_k = torch.eye(k, device=device)
+            self.G = torch.cat([I_k, self.P], dim=1) # (k, n)
+
+            I_p = torch.eye(self.parity_len, device=device)
+            self.H = torch.cat([self.P.T, I_p], dim=1) # (parity_len, n)
+
+            # Syndrome Mapping
+            self.syndrome_table = {}
+            for err_index in range(n):
+                e = torch.zeros(n, device=device)
+                e[err_index] = 1.0
+                s = torch.matmul(e, self.H.T) % 2
+                s_hash = "".join(map(str, s.int().tolist()))
+                self.syndrome_table[s_hash] = err_index
 
 def encode_message_bch(bits, codec):
-    """Multiplies bits by Generator Matrix G."""
+    """Multiplies bits by Generator Matrix G. Identity when k==n."""
     return torch.matmul(bits, codec.G) % 2
 
 def decode_message_bch(rx_bits, codec):
-    """Systematic Syndrome decoding."""
+    """Systematic Syndrome decoding. Pass-through when k==n."""
+    if codec.identity_mode:
+        return rx_bits  # No parity bits — payload IS the codeword
+
     B = rx_bits.shape[0]
     corrected = rx_bits.clone()
     syndromes = torch.matmul(rx_bits, codec.H.T) % 2
-    
+
     for i in range(B):
         s_hash = "".join(map(str, syndromes[i].int().tolist()))
-        if "1" in s_hash: 
+        if "1" in s_hash:
             if s_hash in codec.syndrome_table:
                 err_index = codec.syndrome_table[s_hash]
                 corrected[i, err_index] = 1 - corrected[i, err_index]
-            
+
     return corrected[:, :codec.k]
 
 

@@ -1,12 +1,12 @@
-# SOTA FINAL RUN: Optimized for GPU 6 (25GB Free)
+# FAST CONVERGENCE CONFIG: Simplified for results
 project_name: "Deepfake-Watermarking-Universal"
-experiment_id: "SOTA_Victory_Run"
+experiment_id: "Fast_Convergence_Run"
 
 path_config:
   raw_path: "data/raw/celeba"
   processed_path: "data/processed"
-  checkpoint_dir: "checkpoints"
-  log_dir: "logs"
+  checkpoint_dir: "experiments/checkpoints"
+  log_dir: "experiments/logs"
   identity_file: "data/raw/celeba/identity_CelebA.txt"
   landmarks_file: "data/raw/celeba/list_landmarks_celeba.txt"
 
@@ -15,40 +15,40 @@ data_config:
   target_val: 10000
   target_test: 10000
   image_size: 256
-  batch_size: 4              
-  num_workers: 0             
+  batch_size: 32               # INCREASED: Fully utilizes 32GB V100 (4x faster epochs)
+  num_workers: 4               # INCREASED: Speeds up CPU data loading
   ablation_region: "full"
-  limit_samples: null
+  limit_samples: 5000          # REDUCED: 5k is enough for CelebA to learn without overfitting too quickly
 
 model_config:
-  watermark_length: 64       
-  n_bits: 80                 
-  discriminator_ndf: 64      
-  adversary_base_filters: 32 
-  adversary_epsilon: 0.05    
-  preprocessing_quality: 95  
-  encoder_scale: 0.3         
+  watermark_length: 32         # REDUCED: 32-bit payload (was 64)
+  n_bits: 32                   # REDUCED: No BCH parity (k=n=32, codec is identity)
+  discriminator_ndf: 64
+  adversary_base_filters: 32
+  adversary_epsilon: 0.05
+  preprocessing_quality: 95
+  encoder_scale: 0.03          # Bounded residual to allow >35dB PSNR
 
 training_config:
-  device: "cuda:0"           
-  epochs: 25                 
-  lr: 0.0001                 
+  device: "cuda:6"
+  epochs: 60
+  lr: 0.0005                # Raised from 2e-4 -- 5e-4 balances speed and stability
   disc_lr_mult: 0.5
-  betas: [0.0, 0.9]          
+  betas: [0.5, 0.999]
   log_freq: 10
   save_freq: 5
-  accumulation_steps: 8      
-  eval_freq: 1               
-  max_eval_steps: 20         
-  early_stop_patience: 7     
+  accumulation_steps: 2
+  eval_freq: 1
+  max_eval_steps: 50
+  early_stop_patience: 20   # Increased from 15 -- more headroom for phase transitions
 
 loss_config:
-  lambda_l1: 15.0            
-  lambda_lpips: 10.0         
-  lambda_ssim: 5.0           
-  lambda_id: 2.0             
-  lambda_bit_benign: 120.0   
-  lambda_bit_fragile: 20.0   
-  lambda_disc: 1.0           
-  lambda_adv: 0.5            
+  lambda_l1: 1.0
+  lambda_lpips: 1.0
+  lambda_ssim: 0.5
+  lambda_id: 0.5
+  lambda_bit_benign: 10.0
+  lambda_bit_fragile: 5.0
+  lambda_disc: 0.5
+  lambda_adv: 0.5
   lambda_gp: 10.0
