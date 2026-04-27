@@ -158,33 +158,32 @@ def main():
 
         # --- Phase 1 gate: stay here until bit channel established ---
         if current_phase == 1:
-            # Allow extending past epoch 15 if BER is still too high
-            if epoch <= 15 or last_eval_ber > 0.30:
-                trainer.encoder.encoder_scale    = target_encoder_scale   # FIX: Prevent gradient clamp death
+            # Phase 1: Bit establishment
+            # Fix: We boost encoder_scale to 0.30 here so the randomly initialized Decoder can "see" the signal.
+            # It's small enough to avoid the Dead Clamp, but 10x larger than 0.03.
+            if epoch <= 15 or last_eval_ber > 0.15:
+                trainer.encoder.encoder_scale    = 0.30  # Warmup scale
+                trainer.aug_prob                 = 0.0
                 trainer.criterion.W_L1           = 0.0
                 trainer.criterion.W_LPIPS        = 0.0
                 trainer.criterion.W_SSIM         = 0.0
                 trainer.criterion.W_ID           = 0.0
-                trainer.criterion.W_BIT_BENIGN   = 15.0  # Strong bit signal
+                trainer.criterion.W_BIT_BENIGN   = 20.0
                 trainer.criterion.W_BIT_FRAGILE  = 0.0
                 trainer.criterion.W_DISC         = 0.0
                 trainer.criterion.W_ADV          = 0.0
-                trainer.aug_prob                 = 0.0
-                phase = f"PHASE 1: BIT ESTABLISHMENT (BER={last_eval_ber*100:.1f}%, gate=<15%)"
+                phase = f"PHASE 1: BIT ESTABLISHMENT (BER={last_eval_ber:.1%}, gate=<15%)"
             else:
-                # BER gate passed -- transition to Phase 2a
                 current_phase = 2
                 phase2a_start = epoch
-                best_score = -1.0   # RESET: Phase 2 uses different scoring
-                no_improve_count = 0
                 print(f"\n{'!'*60}")
-                print(f"  [PHASE TRANSITION] BER={last_eval_ber*100:.1f}% < 15% gate!")
-                print(f"  Entering Phase 2a at epoch {epoch}. best_score RESET.")
+                print(f"  [PHASE TRANSITION] Entering Phase 2a (Augmentations) at epoch {epoch}.")
                 print(f"{'!'*60}")
 
         if current_phase == 2:
-            p = min(1.0, (epoch - phase2a_start) / 7.0)   # ramp over 7 epochs
-            trainer.encoder.encoder_scale    = target_encoder_scale
+            # Phase 2a: augmentation ramp over 5 epochs
+            p = min(1.0, (epoch - phase2a_start) / 5.0)
+            trainer.encoder.encoder_scale    = 0.30  # Hold the warmup scale
             trainer.aug_prob                 = p
             trainer.criterion.W_L1           = 0.0
             trainer.criterion.W_LPIPS        = 0.0
@@ -194,31 +193,23 @@ def main():
             trainer.criterion.W_BIT_FRAGILE  = 0.0
             trainer.criterion.W_DISC         = 0.0
             trainer.criterion.W_ADV          = 0.0
-            phase = f"PHASE 2a: AUG ROBUSTNESS (aug={p:.0%}, scale=1.0, bit=20)"
+            phase = f"PHASE 2a: AUG ROBUSTNESS (p={p:.0%})"
 
-            # The moment augmentation becomes active, reset best_score so the
-            # AUGMENTED eval sets the Phase 2a baseline (not the clean epoch 1 eval).
-            if p > 0 and not aug_baseline_reset:
-                aug_baseline_reset = True
-                best_score = -1.0
-                no_improve_count = 0
-                print(f"  [AUG BASELINE RESET] aug_prob={p:.2f} -- resetting best_score for augmented eval.")
-
-            # Transition to Phase 2b after 8 epochs of Phase 2a
-            if phase2a_start is not None and (epoch - phase2a_start) >= 8:
+            if p >= 1.0 and last_eval_ber < 0.20:
                 current_phase = 3
                 phase2b_start = epoch
-                best_score = -1.0   # RESET: Phase 2b uses full QoS scoring
-                no_improve_count = 0
                 print(f"\n{'!'*60}")
-                print(f"  [PHASE TRANSITION] Entering Phase 2b at epoch {epoch}.")
-                print(f"  best_score RESET for quality-inclusive scoring.")
+                print(f"  [PHASE TRANSITION] Entering Phase 2b (Quality Ramp) at epoch {epoch}.")
                 print(f"{'!'*60}")
 
         if current_phase == 3:
             # Phase 2b: quality ramp over 8 epochs
             p = min(1.0, (epoch - phase2b_start) / 8.0)
-            trainer.encoder.encoder_scale    = target_encoder_scale
+            
+            # THE FIX: Smoothly shrink the scale from 0.30 down to target (0.03) as quality losses ramp up
+            current_scale = 0.30 - ((0.30 - target_encoder_scale) * p)
+            trainer.encoder.encoder_scale    = current_scale
+            
             trainer.aug_prob                 = 1.0
             trainer.criterion.W_L1           = lc['lambda_l1']          * p
             trainer.criterion.W_LPIPS        = lc['lambda_lpips']        * p
@@ -228,7 +219,7 @@ def main():
             trainer.criterion.W_BIT_FRAGILE  = lc['lambda_bit_fragile']  * p
             trainer.criterion.W_DISC         = lc['lambda_disc']         * p
             trainer.criterion.W_ADV          = 0.0
-            phase = f"PHASE 2b: QUALITY RAMP (p={p:.0%}, scale={scale_2b:.2f}, aug=100%)"
+            phase = f"PHASE 2b: QUALITY RAMP (p={p:.0%}, scale={current_scale:.3f}, aug=100%)"
 
             # Transition to Phase 3 after 9 epochs of Phase 2b
             if phase2b_start is not None and (epoch - phase2b_start) >= 9:

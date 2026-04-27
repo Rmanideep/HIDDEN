@@ -39,10 +39,11 @@ class FrequencyEncoder(nn.Module):
         self.dct = BlockDCT(block_size=8)
         self.idct = BlockIDCT(block_size=8)
         
+        # 192 frequency channels (3 colors * 8 * 8) + n_bits
         self.ac_residual_conv = nn.Sequential(
-            nn.Conv2d(3 + n_bits, 64, kernel_size=3, padding=1),
+            nn.Conv2d(192 + n_bits, 256, kernel_size=1),
             nn.ReLU(),
-            nn.Conv2d(64, 3, kernel_size=3, padding=1)
+            nn.Conv2d(256, 192, kernel_size=1)
         )
 
     def _get_ac_mask(self, x):
@@ -50,33 +51,36 @@ class FrequencyEncoder(nn.Module):
         Batch-safe and Device-safe mask generation.
         Zeroes out DC component of every 8x8 block.
         """
-        # Create a mask of 1s on the correct device and same shape as input
         mask = torch.ones_like(x)
-        
-        # Strided Indexing: [Batch, Channel, Height, Width]
-        # Start at 0, skip every 8 pixels. This zeroes the (0,0) of every 8x8 block.
         mask[:, :, 0::8, 0::8] = 0
-        
         return mask
         
     def forward(self, img, bits):
         B, C, H, W = img.shape
         
-        # 1. Transform to DCT domain
+        # 1. Transform to DCT domain [B, 3, H, W]
         dct_coeffs = self.dct(img)
         
-        # 2. Broadcast message bits
-        bits_map = bits.view(B, -1, 1, 1).expand(-1, -1, H, W)
+        # 2. Reshape into frequency channels: [B, 192, H//8, W//8]
+        x_reshaped = dct_coeffs.view(B, 3, H//8, 8, W//8, 8)
+        x_reshaped = x_reshaped.permute(0, 1, 3, 5, 2, 4).contiguous().view(B, 192, H//8, W//8)
         
-        # 3. Predict frequency residual
-        x = torch.cat([dct_coeffs, bits_map], dim=1)
-        ac_res = self.ac_residual_conv(x)
+        # 3. Broadcast message bits to H//8, W//8
+        bits_map = bits.view(B, -1, 1, 1).expand(-1, -1, H//8, W//8)
         
-        # 4. Enforce updates only to AC coefficients using the fixed mask
+        # 4. Predict frequency residual using 1x1 convolutions
+        x_cat = torch.cat([x_reshaped, bits_map], dim=1)
+        ac_res_freq = self.ac_residual_conv(x_cat)
+        
+        # 5. Inverse reshape back to [B, 3, H, W]
+        ac_res_spatial = ac_res_freq.view(B, 3, 8, 8, H//8, W//8)
+        ac_res_spatial = ac_res_spatial.permute(0, 1, 4, 2, 5, 3).contiguous().view(B, 3, H, W)
+        
+        # 6. Enforce updates only to AC coefficients using the fixed mask
         ac_mask = self._get_ac_mask(dct_coeffs)
-        modified_dct = dct_coeffs + (ac_res * ac_mask)
+        modified_dct = dct_coeffs + (ac_res_spatial * ac_mask)
         
-        # 5. Reverse transform and return residual
+        # 7. Reverse transform and return residual
         freq_out = self.idct(modified_dct)
         return freq_out - img
 
@@ -145,11 +149,10 @@ class SpatialDecoder(nn.Module):
             
             nn.AdaptiveAvgPool2d((4, 4))
         )
-        self.fc = nn.Linear(512 * 4 * 4, n_bits)
         
     def forward(self, img):
         x = self.net(img)
-        return self.fc(x.view(x.size(0), -1))
+        return x.view(x.size(0), -1)
 
 class FrequencyDecoder(nn.Module):
     """
@@ -160,44 +163,49 @@ class FrequencyDecoder(nn.Module):
         super().__init__()
         self.dct = BlockDCT(block_size=8)
         self.net = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.ReLU(),
-            ResBlock(64),
-            
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.GroupNorm(8, 128),
-            nn.ReLU(),
-            ResBlock(128),
-            
-            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),
+            # Input is [B, 192, 32, 32]
+            nn.Conv2d(192, 256, kernel_size=3, stride=1, padding=1),
             nn.GroupNorm(8, 256),
             nn.ReLU(),
             ResBlock(256),
             
+            # [B, 256, 32, 32] -> [B, 512, 16, 16]
             nn.Conv2d(256, 512, kernel_size=3, stride=2, padding=1),
+            nn.GroupNorm(8, 512),
+            nn.ReLU(),
+            ResBlock(512),
+            
+            # [B, 512, 16, 16] -> [B, 512, 8, 8]
+            nn.Conv2d(512, 512, kernel_size=3, stride=2, padding=1),
             nn.GroupNorm(8, 512),
             nn.ReLU(),
             ResBlock(512),
             
             nn.AdaptiveAvgPool2d((4, 4))
         )
-        self.fc = nn.Linear(512 * 4 * 4, n_bits)
         
     def forward(self, img):
+        B, C, H, W = img.shape
         dct_coeffs = self.dct(img)
-        x = self.net(dct_coeffs)
-        return self.fc(x.view(x.size(0), -1))
+        
+        # Reshape to prevent spectral blindness
+        x_reshaped = dct_coeffs.view(B, 3, H//8, 8, W//8, 8)
+        x_reshaped = x_reshaped.permute(0, 1, 3, 5, 2, 4).contiguous().view(B, 192, H//8, W//8)
+        
+        x = self.net(x_reshaped)
+        return x.view(x.size(0), -1)
 
 class HybridDecoder(nn.Module):
     def __init__(self, n_bits):
         super().__init__()
         self.spatial_decoder = SpatialDecoder(n_bits=n_bits)
         self.freq_decoder = FrequencyDecoder(n_bits=n_bits)
+        
+        # SOTA Feature Fusion: Combine raw 8192 parameters from both domains before deciding bits
         self.fusion_fc = nn.Sequential(
-            nn.Linear(n_bits * 2, 256),
-            nn.ReLU(),
-            nn.Linear(256, n_bits)
+            nn.Linear(8192 * 2, 512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, n_bits)
         )
         
     def forward(self, img):
