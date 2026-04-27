@@ -190,6 +190,7 @@ class FrequencyDecoder(nn.Module):
 class HybridDecoder(nn.Module):
     def __init__(self, n_bits):
         super().__init__()
+        self.spatial_decoder = SpatialDecoder(n_bits=n_bits)
         self.freq_decoder = FrequencyDecoder(n_bits=n_bits)
         
         # SOTA Feature Fusion: Fully Convolutional Decoder
