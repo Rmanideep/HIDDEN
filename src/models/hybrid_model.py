@@ -146,8 +146,7 @@ class SpatialDecoder(nn.Module):
             nn.GroupNorm(8, 512),
             nn.ReLU(),
             ResBlock(512),
-            
-            nn.AdaptiveAvgPool2d((4, 4))
+            nn.AdaptiveAvgPool2d((1, 1))
         )
         
     def forward(self, img):
@@ -180,8 +179,7 @@ class FrequencyDecoder(nn.Module):
             nn.GroupNorm(8, 512),
             nn.ReLU(),
             ResBlock(512),
-            
-            nn.AdaptiveAvgPool2d((4, 4))
+            nn.AdaptiveAvgPool2d((1, 1))
         )
         
     def forward(self, img):
@@ -201,9 +199,10 @@ class HybridDecoder(nn.Module):
         self.spatial_decoder = SpatialDecoder(n_bits=n_bits)
         self.freq_decoder = FrequencyDecoder(n_bits=n_bits)
         
-        # SOTA Feature Fusion: Combine raw 8192 parameters from both domains before deciding bits
+        # SOTA Feature Fusion: Global Average Pooling outputs 512 features per domain
+        # Combine 1024 raw features into a stable 512 hidden layer
         self.fusion_fc = nn.Sequential(
-            nn.Linear(8192 * 2, 512),
+            nn.Linear(512 * 2, 512),
             nn.ReLU(inplace=True),
             nn.Linear(512, n_bits)
         )
