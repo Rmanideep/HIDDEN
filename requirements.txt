@@ -1,18 +1,43 @@
+# Core PyTorch & Vision
 torch>=2.0.0
 torchvision>=0.15.0
-numpy
-PyYAML
-pillow
-opencv-python
-scipy
-tqdm
-lpips
-matplotlib
-tensorboard
-facenet-pytorch
-pandas
-kornia
-scikit-learn
+torchaudio>=2.0.0
+
+# Scientific Computing
+numpy>=1.21.0
+scipy>=1.7.0
+scikit-learn>=1.0.0
+
+# Configuration & Data Handling
+PyYAML>=5.4.1
+pandas>=1.3.0
+
+# Image Processing & Augmentation
+pillow>=9.0.0
+opencv-python>=4.5.0
+opencv-contrib-python>=4.5.0
+imageio>=2.9.0
+kornia>=0.6.8
+
+# Deep Learning Loss Functions & Metrics
+lpips>=0.1.4
+facenet-pytorch>=2.5.0
+
+# Training & Evaluation
+tensorboard>=2.10.0
+torch-tb-profiler>=0.2.0
+
+# Model Architecture & Training Enhancements
 diffusers>=0.21.0
 transformers>=4.30.0
-torchattacks
+accelerate>=0.19.0
+torchattacks>=1.11.0
+
+# Visualization & Monitoring
+matplotlib>=3.5.0
+tqdm>=4.62.0
+
+# Optional but Recommended
+einops>=0.6.0
+torch-ema>=0.3
+setuptools>=59.6.0

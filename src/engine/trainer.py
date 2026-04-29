@@ -74,6 +74,7 @@ class WatermarkLoss(nn.Module):
 
         # --- Bit-Level Losses ---
         self.bce = nn.BCELoss()
+        self.bce_logits = nn.BCEWithLogitsLoss()  # NEW: For logits output from auxiliary head
 
         # --- Discriminator Loss (WGAN-GP style) ---
         # Wasserstein: L = E[C(fake)] - E[C(real)]
@@ -94,12 +95,22 @@ class WatermarkLoss(nn.Module):
                 msg_pred_benign, msg_pred_attacked=None,
                 disc_pred_fake=None, msg_pred_adv=None):
         """
-        Computes the full 8-component loss.
+        Computes the full 8-component loss using a HYBRID DOMAIN SEMI-FRAGILE APPROACH.
+
+        CRITICAL: The L_RE (Bit Recovery Error) loss is the core innovation:
+            L_RE(x) = L1(b, b_benign) - L1(b, b_malicious)
+        
+        This single loss simultaneously:
+        - Minimizes L1 error on benign transforms (ROBUSTNESS: recover bits after edits)
+        - Maximizes L1 error on malign transforms (FRAGILITY: fail after deepfakes)
+        - Creates strong gradients even when benign & malicious predictions are close
+
+        This approach achieves high benign BRA and controlled malign BRA.
 
         Args:
             I:          (B, 3, H, W) Original host image I.
-            I_w:             (B, 3, H, W) Watermarked image I'.
-            msg_encoded:       (B, N) Ground-truth encoded message bits.
+            I_w:        (B, 3, H, W) Watermarked image I'.
+            msg_encoded: (B, N) Ground-truth encoded message bits.
             msg_pred_benign:   (B, N) Decoded bits after benign augmentations.
             msg_pred_attacked: (B, N) Decoded bits after deepfake/malign attack.
             disc_pred_fake:    (B, 1, H', W') Discriminator logits on I' (optional).
@@ -129,18 +140,38 @@ class WatermarkLoss(nn.Module):
         loss_id = self.get_identity_mse(I, I_w)
         metrics['id'] = loss_id.item()
 
-        # ===================== SECURITY =====================
-        # Use autocast(enabled=False) for BCE to prevent precision issues
+        # ===================== SECURITY: L_RE SEMI-FRAGILE LOSS =====================
+        # HYBRID DOMAIN INNOVATION: Bit Recovery Error loss enables semi-fragile watermarking
+        # 
+        # L_RE = L1(bits_pred - bits_truth | benign_transform) 
+        #      - L1(bits_pred - bits_truth | malicious_transform)
+        # 
+        # Formula: 
+        # - First term (minimize): Bits recover correctly after benign edits (robustness)
+        # - Second term (maximize): Bits fail after deepfake attacks (fragility)
+        # - Difference creates continuous gradient everywhere
+        # 
+        # Unlike BCE at 0.5 (flat gradient), this provides strong signal at all predictions.
         with torch.cuda.amp.autocast(enabled=False):
-            # 5. Benign Bit Loss - Recover bits after benign edits (robustness)
-            loss_bit_benign = self.bce(msg_pred_benign.float(), msg_encoded.float())
-            metrics['bit_benign'] = loss_bit_benign.item()
+            # 5. Benign Component: Minimize BCE error after benign transforms
+            # Using BCEWithLogitsLoss for superior numerical stability and gradient flow
+            loss_bce_benign = F.binary_cross_entropy_with_logits(msg_pred_benign.float(), msg_encoded.float(), reduction='mean')
+            
+            # Use sigmoid for L1 components to keep them in [0, 1] range
+            prob_benign = torch.sigmoid(msg_pred_benign.float())
+            loss_l1_benign = F.l1_loss(prob_benign, msg_encoded.float(), reduction='mean')
+            metrics['l1_benign'] = loss_l1_benign.item()
 
-            # 6. Fragile Bit Loss - Force bit destruction after deepfake attack
-            loss_bit_fragile = torch.tensor(0.0, device=self.device)
+            # 6. Malign Component: Maximize L1 error after malicious transforms  
+            loss_l1_malicious = torch.tensor(0.0, device=self.device)
             if msg_pred_attacked is not None:
-                loss_bit_fragile = self.bce(msg_pred_attacked.float(), (1.0 - msg_encoded).float())
-            metrics['bit_fragile'] = loss_bit_fragile.item()
+                prob_attacked = torch.sigmoid(msg_pred_attacked.float())
+                loss_l1_malicious = F.l1_loss(prob_attacked, msg_encoded.float(), reduction='mean')
+            metrics['l1_malicious'] = loss_l1_malicious.item()
+            
+            # L_RE Loss: Minimize benign error, maximize malicious error
+            loss_bit_fragile = loss_l1_benign - loss_l1_malicious
+            metrics['l_re'] = loss_bit_fragile.item()
 
         # ===================== ADVERSARIAL =====================
 
@@ -156,20 +187,22 @@ class WatermarkLoss(nn.Module):
         # ===================== RESILIENCE =====================
 
         # 8. Adversary Loss - Recover bits even after learned AdversaryNet attack
-        loss_adv = torch.tensor(0.0, device=self.device)
         if msg_pred_adv is not None:
             with torch.cuda.amp.autocast(enabled=False):
-                loss_adv = self.bce(msg_pred_adv.float(), msg_encoded.float())
+                # Use BCEWithLogits for gradient flow
+                loss_adv = F.binary_cross_entropy_with_logits(msg_pred_adv.float(), msg_encoded.float())
         metrics['adv'] = loss_adv.item()
 
-        # ===================== WEIGHTED SUM =====================
+        # ===================== WEIGHTED SUM: HYBRID DOMAIN APPROACH =====================
+        # All losses are active from Epoch 1 (NO CURRICULUM)
+        # The key innovation is L_RE loss which combines robustness + fragility
         total_loss = (
             self.W_L1          * loss_l1 +
             self.W_LPIPS       * loss_lpips +
             self.W_SSIM        * loss_ssim +
             self.W_ID          * loss_id +
-            self.W_BIT_BENIGN  * loss_bit_benign +
-            self.W_BIT_FRAGILE * loss_bit_fragile +
+            self.W_BIT_BENIGN  * loss_bce_benign +      # Minimize benign BCE (robustness + strong gradients)
+            self.W_BIT_FRAGILE * loss_bit_fragile +     # L_RE: maximize (benign - malicious) difference
             self.W_DISC        * loss_disc +
             self.W_ADV         * loss_adv
         )
@@ -221,11 +254,7 @@ class WatermarkTrainer:
         self.n_bits = config['model_config']['n_bits']
         self.log_freq = config['training_config']['log_freq']
 
-        # =====================================================================
-        # BCH CODEC INITIALIZATION
-        # =====================================================================
-        k = config['model_config']['watermark_length']
-        self.codec = FunctionalBlockCodec(k=k, n=self.n_bits, device=self.device)
+        # Removed BCH Codec - Using Raw Bits directly (Identity mode)
 
         # =====================================================================
         # THREE SEPARATE OPTIMIZERS - One per competing network
@@ -277,7 +306,7 @@ class WatermarkTrainer:
         self.scaler_adv = GradScaler()
 
         # --- Loss & Logging ---
-        self.criterion = WatermarkLoss(config=config)
+        self.criterion = WatermarkLoss(config=config).to(self.device)
         self.disc_loss_fn = nn.BCEWithLogitsLoss()  # Kept only for adversary BCE steps
         self.bce = nn.BCELoss()
         self.writer = SummaryWriter(config['path_config']['log_dir'])
@@ -289,8 +318,20 @@ class WatermarkTrainer:
         self.eval_freq = tc.get('eval_freq', 1)
         self.max_eval_steps = tc.get('max_eval_steps', None)
 
-        # --- Augmentation Probability (set by train.py curriculum) ---
-        self.aug_prob = 0.0  # 0.0 = no augmentations, 1.0 = always augment
+        # --- Augmentation Probability ---
+        # Changed to 0.5 to allow stable 'clean' signal acquisition alongside robustness training
+        self.aug_prob = 0.5  
+
+    def _apply_soft_mask(self, I, M):
+        """
+        Feathers the mask edges to avoid sharp DCT artifacts.
+        A hard mask (I * M) creates a spectral spike that drowns out the watermark.
+        """
+        # Create a softened mask using a simple box blur (3x3 mean) repeated
+        # This is faster than GaussianBlur and sufficient for edge suppression.
+        with torch.no_grad():
+            m_soft = F.avg_pool2d(F.pad(M, (4,4,4,4), mode='replicate'), (9,9), stride=1)
+        return I * m_soft
 
     # =====================================================================
     # WGAN-GP: GRADIENT PENALTY COMPUTATION
@@ -358,6 +399,10 @@ class WatermarkTrainer:
     # =====================================================================
     def _step_optimizer(self, optimizer, scaler, loss, is_last, params=None):
         """Helper to handle gradient scaling, accumulation, and stepping."""
+        # Check for NaN/Inf loss before backprop
+        if torch.isnan(loss) or torch.isinf(loss):
+            raise RuntimeError(f"Loss is NaN or Inf: {loss.item()}")
+        
         # Normalize loss for accumulation
         loss = loss / self.accumulation_steps
         scaler.scale(loss).backward()
@@ -399,8 +444,10 @@ class WatermarkTrainer:
         pred_real = self.discriminator(img_orig.detach())
         pred_fake = self.discriminator(I_w.detach())
 
-        # Wasserstein Critic Loss: maximize E[C(real)] - E[C(fake)]
-        # i.e. minimize E[C(fake)] - E[C(real)]
+        # Wasserstein Critic Loss: minimize E[C(fake)] - E[C(real)]
+        # Correct formulation: pred_fake - pred_real
+        # When critic works correctly: C(real) > C(fake) 
+        # Optimizer minimizes this loss → pushes C(fake) lower, C(real) higher
         loss_wasserstein = pred_fake.mean() - pred_real.mean()
 
         # Gradient Penalty (enforces 1-Lipschitz continuity)
@@ -420,8 +467,13 @@ class WatermarkTrainer:
     # =====================================================================
     def _train_adversary(self, I_w, msg_encoded, is_last=True):
         """
-        Adversary objective: Maximize BER after attacking I'.
-        The adversary learns to perturb I' to destroy the embedded bits.
+        Adversary objective: Maximize BER by making watermark unrecoverable.
+        
+        The adversary learns to perturb I' such that the decoded bits become RANDOM (~0.5).
+        This simulates deepfake attacks that destroy biometric watermarks.
+        
+        Target: Make decoder output ~0.5 (random, maximum uncertainty)
+        This is more realistic than inverting bits.
         """
         self._unfreeze(self.adversary)
         self._freeze(self.encoder)
@@ -437,10 +489,13 @@ class WatermarkTrainer:
             # Decode bits from the attacked image
             pred_bits = self.decoder(img_attacked)
 
-            # Adversary wants the decoded bits to be the INVERSE of the truth
-            # This maximizes the Bit Error Rate
+            # Adversary wants decoded bits to be RANDOM (close to 0.5)
+            # This maximizes uncertainty and bit error rate
+            # Target: 0.5 everywhere (neutral/random predictions)
             with torch.cuda.amp.autocast(enabled=False):
-                loss_adv = self.bce(pred_bits.float(), (1.0 - msg_encoded).float())
+                random_target = 0.5 * torch.ones_like(pred_bits)
+                # Use sigmoid to map logits to [0, 1] range for BCE comparison with 0.5 target
+                loss_adv = F.binary_cross_entropy(torch.sigmoid(pred_bits.float()), random_target.float())
 
         self._step_optimizer(self.opt_adv, self.scaler_adv, loss_adv, is_last, params=self.adversary.parameters())
 
@@ -471,8 +526,6 @@ class WatermarkTrainer:
             # --- Forward: Encode ---
             I_w = self.encoder(I, M, msg_encoded)
 
-            # --- Benign Path (Robustness) ---
-            # Augmentation probability controlled by curriculum (train.py sets self.aug_prob)
             if self.aug_prob > 0 and random.random() < self.aug_prob:
                 benign_w = self.benign_pipeline(I_w)
                 pred_benign = self.decoder(benign_w)
@@ -483,6 +536,13 @@ class WatermarkTrainer:
             pred_attacked = None
             if self.criterion.W_BIT_FRAGILE > 0:
                 attacked_w = self.malign_attack(I_w, I_donor, M)
+                
+                # CRITICAL: After deepfake, apply benign augmentations (JPEG/blur)
+                # This simulates real-world scenario: FaceSwap → upload to social media → JPEG compression
+                # The adversary now must fool BOTH the deepfake AND the compression
+                if self.aug_prob > 0 and random.random() < self.aug_prob:
+                    attacked_w = self.benign_pipeline(attacked_w)
+                
                 pred_attacked = self.decoder(attacked_w)
 
             # --- Discriminator Signal (Realism) --- GATED: skip when weight is 0
@@ -505,8 +565,9 @@ class WatermarkTrainer:
 
         # --- Decoder Output Diagnostics ---
         with torch.no_grad():
-            metrics['dec_mean'] = pred_benign.mean().item()
-            metrics['dec_std'] = pred_benign.std().item()
+            prob_benign = torch.sigmoid(pred_benign.float())
+            metrics['dec_mean'] = prob_benign.mean().item()
+            metrics['dec_std'] = prob_benign.std().item()
 
         params_encdec = list(self.encoder.parameters()) + list(self.decoder.parameters())
         self._step_optimizer(self.opt_encdec, self.scaler_encdec, total_loss, is_last, params=params_encdec)
@@ -531,7 +592,7 @@ class WatermarkTrainer:
 
         for i, (I, M, m_gt, I_donor) in enumerate(self.train_loader):
             I, M, m_gt, I_donor = I.to(self.device), M.to(self.device), m_gt.to(self.device), I_donor.to(self.device)
-            msg_encoded = encode_message_bch(m_gt, self.codec)
+            msg_encoded = m_gt  # Raw Bits
 
             # Multi-batch Gradient Accumulation Logic
             is_last = (i + 1) % self.accumulation_steps == 0 or (i + 1) == len(self.train_loader)
@@ -574,8 +635,8 @@ class WatermarkTrainer:
                     f"A: {loss_a:.4f} | "
                     f"L1: {metrics['l1']:.4f} | "
                     f"LPIPS: {metrics['lpips']:.4f} | "
-                    f"BER_b: {metrics['bit_benign']:.4f} | "
-                    f"BER_adv: {metrics['adv']:.4f} | "
+                    f"BER_b: {metrics.get('l1_benign', 0):.4f} | "
+                    f"BER_adv: {metrics.get('adv', 0):.4f} | "
                     f"Dec: mu={metrics.get('dec_mean', 0):.3f} sig={metrics.get('dec_std', 0):.3f}"
                 )
                 # TensorBoard -- float() safely converts to Python scalar
@@ -617,15 +678,14 @@ class WatermarkTrainer:
             M = M.to(self.device)
             m_gt = m_gt.to(self.device)
             I_donor = I_donor.to(self.device)
-            msg_encoded = encode_message_bch(m_gt, self.codec)
+            msg_encoded = m_gt  # Raw Bits
 
             with autocast():
                 I_w = self.encoder(I, M, msg_encoded)
-                # Match training condition: only augment if aug_prob > 0
                 if self.aug_prob > 0:
                     benign_w = self.benign_pipeline(I_w)
                 else:
-                    benign_w = I_w  # Clean eval during Phase 1 (matches training)
+                    benign_w = I_w
 
                 pred_benign = self.decoder(benign_w)
 
@@ -633,6 +693,12 @@ class WatermarkTrainer:
                 pred_attacked = None
                 if self.criterion.W_BIT_FRAGILE > 0:
                     attacked_w = self.malign_attack(I_w, I_donor, M)
+                    
+                    # CRITICAL: Apply benign augmentations after deepfake attack
+                    # Simulates: FaceSwap → upload to social media → JPEG compression
+                    if self.aug_prob > 0:
+                        attacked_w = self.benign_pipeline(attacked_w)
+                    
                     pred_attacked = self.decoder(attacked_w)
                 else:
                     # Placeholder: random chance (untrained path)
@@ -651,16 +717,17 @@ class WatermarkTrainer:
                 loss_lpips = self.criterion.lpips_vgg((I * 2.0) - 1.0, (I_w * 2.0) - 1.0).mean()
                 loss_id = self.criterion.get_identity_mse(I, I_w)
 
-            # BER Calculations
-            raw_ber_b = ((pred_benign > 0.5).float() != msg_encoded).float().mean()
+            # BER Calculations (Raw Bit Recovery)
+            raw_ber_b = ((pred_benign > 0.0).float() != msg_encoded).float().mean()
             
-            bch_pred_b = decode_message_bch((pred_benign > 0.5).float(), self.codec)
-            bch_pred_a = decode_message_bch((pred_attacked > 0.5).float(), self.codec)
-            bch_pred_adv = decode_message_bch((pred_adv > 0.5).float(), self.codec)
+            prob_benign = torch.sigmoid(pred_benign.float())
+            prob_attacked = torch.sigmoid(pred_attacked.float())
+            prob_adv = torch.sigmoid(pred_adv.float())
 
-            ber_benign = (bch_pred_b != m_gt).float().mean()
-            ber_attacked = (bch_pred_a != m_gt).float().mean()
-            ber_adv = (bch_pred_adv != m_gt).float().mean()
+            # Without BCH, we just compare thresholds
+            ber_benign = ((prob_benign > 0.5).float() != m_gt).float().mean()
+            ber_attacked = ((prob_attacked > 0.5).float() != m_gt).float().mean()
+            ber_adv = ((prob_adv > 0.5).float() != m_gt).float().mean()
 
             # PSNR & SSIM
             psnr = K_metrics.psnr(I_w.float(), I.float(), max_val=1.0).mean()
@@ -694,7 +761,7 @@ class WatermarkTrainer:
         print(f"  EPOCH {epoch} EVALUATION REPORT")
         print(f"{'='*55}")
         print(f"  RAW Neural BER:   {avg_raw_ber*100:>6.2f}%")
-        print(f"  BER (BCH Benign): {avg_ber_b*100:>6.2f}%  (Target: < 2%)")
+        print(f"  BER (Benign):     {avg_ber_b*100:>6.2f}%  (Target: < 2%)")
         print(f"  BER (Deepfake):   {avg_ber_a*100:>6.2f}%  (Target: > 70%)")
         print(f"  BER (Adversary):  {avg_ber_adv*100:>6.2f}%  (Target: < 5%)")
         print(f"  PSNR:             {avg_psnr:>6.2f} dB (Target: > 35dB)")

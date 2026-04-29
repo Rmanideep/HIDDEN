@@ -17,7 +17,7 @@ class ResBlock(nn.Module):
 
     def forward(self, x):
         residual = x
-        out = F.relu(self.gn1(self.conv1(x)))
+        out = F.leaky_relu(self.gn1(self.conv1(x)), 0.2)
         out = self.gn2(self.conv2(out))
         out += residual
-        return F.relu(out)
+        return F.leaky_relu(out, 0.2)

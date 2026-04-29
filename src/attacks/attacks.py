@@ -22,9 +22,10 @@ class BenignAugmentationPipeline(nn.Module):
         self.jpeg_50 = DiffJPEG(quality=50)
         self.jpeg_75 = DiffJPEG(quality=75)
         
-        # Geometric Distortions (Kornia)
-        self.rotate = K.RandomRotation(degrees=8.0, p=1.0)
-        self.hflip = K.RandomHorizontalFlip(p=1.0)
+        # NOTE: Geometric distortions (rotation, flip, crop) REMOVED
+        # Reason: Spatial-frequency alignment breaks under rotation
+        # Benign augmentation now focuses on: JPEG, blur, color jitter, Instagram filters
+        # These are sufficient for realistic deepfake detection scenarios
         
         # Filtering
         self.blur_3x3 = K.RandomGaussianBlur(kernel_size=(3, 3), sigma=(0.1, 1.0), p=1.0)
@@ -37,14 +38,24 @@ class BenignAugmentationPipeline(nn.Module):
         noise = torch.randn_like(I) * std
         return torch.clamp(I + noise, 0.0, 1.0)
 
-    def center_crop_and_resize(self, I, scale=0.75):
-        B, C, H, W = I.shape
-        crop_size = int(H * scale)
-        start = (H - crop_size) // 2
+    def rgb_to_ycbcr(self, I):
+        """Convert RGB to YCbCr and back - tests color channel resilience."""
+        r, g, b = I[:, 0:1, :, :], I[:, 1:2, :, :], I[:, 2:3, :, :]
         
-        cropped = I[:, :, start:(start+crop_size), start:(start+crop_size)]
-        resized = F.interpolate(cropped, size=(H, W), mode='bilinear', align_corners=False)
-        return resized
+        # RGB to YCbCr
+        y = 0.299 * r + 0.587 * g + 0.114 * b
+        cb = (b - y) / 1.772 + 0.5
+        cr = (r - y) / 1.402 + 0.5
+        
+        # YCbCr back to RGB
+        cb_shift = cb - 0.5
+        cr_shift = cr - 0.5
+        r_out = y + 1.402 * cr_shift
+        g_out = y - 0.114 * 1.772 / 0.587 * cb_shift - 0.299 * 1.402 / 0.587 * cr_shift
+        b_out = y + 1.772 * cb_shift
+        
+        rgb = torch.cat([r_out, g_out, b_out], dim=1)
+        return torch.clamp(rgb, 0.0, 1.0)
 
     def apply_instagram_filter(self, I):
         x_contrast = 0.5 - 0.5 * torch.cos(I * 3.14159265)
@@ -58,15 +69,15 @@ class BenignAugmentationPipeline(nn.Module):
     def forward(self, I_w):
         img = I_w.clone()
         
-        # Geometric distortions disabled! Simple CNN decoders without STN
-        # cannot survive arbitrary spatial grids or flipped bit sequences.
-        # if random.random() < 0.3:
-        #     img = self.rotate(img)
-        # if random.random() < 0.3:
-        #     img = self.center_crop_and_resize(img, scale=0.75)
-        # if random.random() < 0.3:
-        #     img = self.hflip(img)
+        # ACTIVE BENIGN TRANSFORMS (Spatial-alignment compatible)
+        # ✓ JPEG (Q=25/50/75): Drops high-freq, our low AC[0,1,2] survive
+        # ✓ Gaussian Blur: Spatial patterns recoverable with strong signal
+        # ✓ Color Jitter: Per-channel independent, alignment preserved
+        # ✓ Instagram Filter: Similar to color jitter, preserves alignment
+        # ✓ YCbCr Conversion: Tests color channel resilience, preserves positions
+        # ✗ REMOVED: Rotation, Geometric Scaling, HFlip, Crop (break alignment)
             
+        # Blur or Noise (mutually exclusive)
         p_filter = random.random()
         if p_filter < 0.1:
             img = self.blur_3x3(img)
@@ -74,12 +85,20 @@ class BenignAugmentationPipeline(nn.Module):
             img = self.blur_5x5(img)
         elif p_filter < 0.3:
             img = self.add_gaussian_noise(img)
-            
+        
+        # Color space conversion (25% chance)
+        if random.random() < 0.25:
+            img = self.rgb_to_ycbcr(img)
+        
+        # Color jitter (30% chance)
         if random.random() < 0.3:
             img = self.color_jitter(img)
+        
+        # Instagram filter (20% chance)
         if random.random() < 0.2:
             img = self.apply_instagram_filter(img)
             
+        # JPEG compression (50% chance, mutually exclusive quality)
         if random.random() < 0.5:
             p_jpeg = random.random()
             if p_jpeg < 0.33:
@@ -173,9 +192,14 @@ class MalignAttackGenerator(nn.Module):
 
     def forward(self, I_w, I_donor, M):
         val = random.random()
-        if val < 0.45:
+        # Latent distortion: 50% (fast, learnable gradients)
+        if val < 0.50:
             return self.latent_distorter(I_w, M)
+        # Semantic face swap: 40% (realistic, learnable gradients)
         elif val < 0.90:
             return self.semantic_face_swap(I_w, I_donor, M)
+        # Generative inpainting: 10% (expensive, non-learnable but realistic)
+        # NOTE: Generative inpaint is non-differentiable (uses Stable Diffusion)
+        # but decoder still learns to fail on it via L_RE loss without backprop
         else:
             return self.generative_inpaint(I_w, M)

@@ -1,6 +1,5 @@
-# FAST CONVERGENCE CONFIG: Simplified for results
-project_name: "Deepfake-Watermarking-Universal"
-experiment_id: "Fast_Convergence_Run"
+project_name: "Hybrid-Domain-Semi-Fragile-Watermarking"
+experiment_id: "Semi_Fragile_L_RE_Loss"
 
 path_config:
   raw_path: "data/raw/celeba"
@@ -15,40 +14,50 @@ data_config:
   target_val: 10000
   target_test: 10000
   image_size: 256
-  batch_size: 32               # INCREASED: Fully utilizes 32GB V100 (4x faster epochs)
-  num_workers: 4               # INCREASED: Speeds up CPU data loading
+  batch_size: 32              # Optimized for V100 (Increased for convergence)
+  num_workers: 4              # CPU data loading
   ablation_region: "full"
-  limit_samples: 5000          # REDUCED: 5k is enough for CelebA to learn without overfitting too quickly
+  limit_samples: 10000          # Medium-scale smoke test to verify aug_prob: 0.5 fix
+
+augmentation_config:
+  enable_strong_aug: true
+  rotation_range: 0            # ← DISABLED (breaks spatial-frequency alignment)
+  color_jitter: 0.2
+  affine_scale: null           # ← DISABLED (breaks spatial-frequency alignment)
+  horizontal_flip: false
+  blur_prob: 0.1
+  cutout_prob: 0.1
 
 model_config:
-  watermark_length: 32         # REDUCED: 32-bit payload (was 64)
-  n_bits: 32                   # REDUCED: No BCH parity (k=n=32, codec is identity)
+  watermark_length: 64         # 64-bit payload
+  n_bits: 64                   # 64 bits
   discriminator_ndf: 64
   adversary_base_filters: 32
-  adversary_epsilon: 0.05
+  adversary_epsilon: 0.01      # Small epsilon for subtle perturbations
   preprocessing_quality: 95
-  encoder_scale: 0.03          # Bounded residual to allow >35dB PSNR
+  encoder_scale: 1.0           # Full strength - L_RE loss handles fragility
 
 training_config:
-  device: "cuda:6"
-  epochs: 60
-  lr: 0.0005                # Raised from 2e-4 -- 5e-4 balances speed and stability
-  disc_lr_mult: 0.5
+  device: "cuda:7"
+  epochs: 30                   # ~70,000 iterations ÷ 1,000 samples/epoch = 70 epochs
+  lr: 0.0002                  # Slightly increased for faster convergence with balanced losses
+  disc_lr_mult: 1.0           # WGAN-GP uses same LR as encoder
   betas: [0.5, 0.999]
   log_freq: 10
   save_freq: 5
-  accumulation_steps: 2
+  accumulation_steps: 1        # No accumulation (batch fits on GPU)
   eval_freq: 1
-  max_eval_steps: 50
-  early_stop_patience: 20   # Increased from 15 -- more headroom for phase transitions
+  max_eval_steps: 50          # More eval steps for better statistics
+  early_stop_patience: 15      # Allow longer convergence (no curriculum gates)
 
 loss_config:
-  lambda_l1: 1.0
-  lambda_lpips: 1.0
-  lambda_ssim: 0.5
-  lambda_id: 0.5
-  lambda_bit_benign: 10.0
-  lambda_bit_fragile: 5.0
-  lambda_disc: 0.5
-  lambda_adv: 0.5
-  lambda_gp: 10.0
+  # === BALANCED LOSSES FOR STABILITY ===
+  lambda_l1: 15.0              # Priority 1: Restore PSNR (>35dB) during refinement
+  lambda_lpips: 1.0            # Priority 1: Keep visual quality high
+  lambda_ssim: 1.0             # Priority 1: Keep structural integrity
+  lambda_id: 0.1               # Already stable
+  lambda_bit_benign: 10.0      # Priority 2: Maintain bit recovery (reduced now that mapping is learned)
+  lambda_bit_fragile: 5.0      # Priority 3: Maintain Semi-fragility
+  lambda_disc: 0.1             # Critic loss
+  lambda_adv: 0.1              # Adversary loss
+  lambda_gp: 10.0              # WGAN-GP gradient penalty

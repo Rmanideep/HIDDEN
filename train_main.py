@@ -3,7 +3,9 @@ import yaml
 import argparse
 import os
 import torch
+import torch.optim as optim
 import sys
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # Ensure the root directory is in the path to allow absolute imports from 'src'
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
@@ -97,156 +99,57 @@ def main():
         config, encoder, decoder, discriminator, adversary,
         train_loader, val_loader
     )
+
+    # Extract optimizer hyperparameters from config
+    base_lr = config['training_config']['lr']
+    disc_lr_mult = config['training_config']['disc_lr_mult']
+    betas = tuple(config['training_config']['betas'])
+
+    trainer.opt_encdec = optim.Adam([
+        {'params': trainer.encoder.parameters(), 'lr': base_lr, 'name': 'encoder'},
+        {'params': trainer.decoder.parameters(), 'lr': base_lr * 2.0, 'name': 'decoder'},
+    ], betas=betas)
+    
+    trainer.scheduler_encdec = ReduceLROnPlateau(
+        trainer.opt_encdec, mode='min', factor=0.3, patience=12, min_lr=1e-6, verbose=True
+    )
+    print(f"Joint training: enc_lr={base_lr:.5f}, dec_lr={base_lr:.5f}")
+    print(f"scheduler_encdec initialized.")
     
     epochs = config['training_config']['epochs']
     best_score = -1.0
-    
-    # Early Stopping
     patience = config['training_config'].get('early_stop_patience', 20)
     no_improve_count = 0
     
-    # Phase tracking -- used for best_score resets and BER gating
-    current_phase = 1
-    last_eval_ber = 1.0   # Tracks latest BER for the phase gate
-    
-    # Store config values for curriculum
-    target_encoder_scale = config['model_config'].get('encoder_scale', 1.0)
-    lc = config['loss_config']
-    
-    # =================================================================
-    # REVISED CURRICULUM: 4 Phases with BER Gate
-    #
-    # Phase 1 (1-15+): Bounded Bit Establishment
-    #   - encoder_scale=0.3 + tanh clamp (now bounded to +/-0.3 per pixel)
-    #   - W_BIT=10 (sole loss), aug=0%
-    #   - BER GATE: stays in Phase 1 until Raw BER < 15%
-    #   - best_score resets when phase transitions
-    #
-    # Phase 2a (BER<15% achieved, up to epoch 25):
-    #   - Augmentation ramps 0% -> 100% over 7 epochs
-    #   - No quality/disc losses yet -- bit dominates
-    #
-    # Phase 2b (epochs 26-33): Quality Ramp
-    #   - Quality, disc, fragile ramp in
-    #   - encoder_scale stays at 0.3 (invisibility limited but stable)
-    #
-    # Phase 3 (34+): Full Arms Race
-    #   - All objectives at full strength
-    # =================================================================
-    
     print(f"\n{'='*60}")
-    print(f"  FIXED 4-PHASE CURRICULUM (BER-Gated)")
+    print(f"  Hybrid Domain Semi-Fragile Watermarking System")
+    print(f"  L_RE Loss: L1(benign) - L1(malicious) from Epoch 1")
     print(f"  Epochs: {epochs} | Device: {config['training_config']['device']}")
-    print(f"  LR: {config['training_config']['lr']} | Patience: {patience}")
-    print(f"  Phase 1  (1-??): Bit Establishment | BER gate < 15%")
-    print(f"  Phase 2a (??-??): Aug Robustness   | aug ramp 0->100%")
-    print(f"  Phase 2b (??-??): Quality Ramp     | quality + disc ramp")
-    print(f"  Phase 3  (??+):  Arms Race          | full adversarial")
+    print(f"  LR: {base_lr} | Batch Size: {config['data_config']['batch_size']}")
+    print(f"  Patience: {patience} | All networks active from Epoch 1")
     print(f"{'='*60}")
-    
-    # Track when each phase started (for duration-based ramping)
-    phase2a_start = None
-    phase2b_start = None
-    phase3_start  = None
-    aug_baseline_reset = False  # Resets best_score when augmentation first activates
 
     for epoch in range(1, epochs + 1):
         # =================================================================
-        # BER-GATED CURRICULUM LOGIC
-        # Phase transitions are driven by BER achievement, not epoch number
+        # HYBRID DOMAIN APPROACH: No all networks from Epoch 1
         # =================================================================
-
-        # --- Phase 1 gate: stay here until bit channel established ---
-        if current_phase == 1:
-            # Phase 1: Bit establishment
-            # Fix: We boost encoder_scale to 0.30 here so the randomly initialized Decoder can "see" the signal.
-            # It's small enough to avoid the Dead Clamp, but 10x larger than 0.03.
-            if epoch <= 15 or last_eval_ber > 0.15:
-                trainer.encoder.encoder_scale    = 0.30  # Warmup scale
-                trainer.aug_prob                 = 0.0
-                trainer.criterion.W_L1           = 0.0
-                trainer.criterion.W_LPIPS        = 0.0
-                trainer.criterion.W_SSIM         = 0.0
-                trainer.criterion.W_ID           = 0.0
-                trainer.criterion.W_BIT_BENIGN   = 20.0
-                trainer.criterion.W_BIT_FRAGILE  = 0.0
-                trainer.criterion.W_DISC         = 0.0
-                trainer.criterion.W_ADV          = 0.0
-                phase = f"PHASE 1: BIT ESTABLISHMENT (BER={last_eval_ber:.1%}, gate=<15%)"
-            else:
-                current_phase = 2
-                phase2a_start = epoch
-                print(f"\n{'!'*60}")
-                print(f"  [PHASE TRANSITION] Entering Phase 2a (Augmentations) at epoch {epoch}.")
-                print(f"{'!'*60}")
-
-        if current_phase == 2:
-            # Phase 2a: augmentation ramp over 5 epochs
-            p = min(1.0, (epoch - phase2a_start) / 5.0)
-            trainer.encoder.encoder_scale    = 0.30  # Hold the warmup scale
-            trainer.aug_prob                 = p
-            trainer.criterion.W_L1           = 0.0
-            trainer.criterion.W_LPIPS        = 0.0
-            trainer.criterion.W_SSIM         = 0.0
-            trainer.criterion.W_ID           = 0.0
-            trainer.criterion.W_BIT_BENIGN   = 20.0
-            trainer.criterion.W_BIT_FRAGILE  = 0.0
-            trainer.criterion.W_DISC         = 0.0
-            trainer.criterion.W_ADV          = 0.0
-            phase = f"PHASE 2a: AUG ROBUSTNESS (p={p:.0%})"
-
-            if p >= 1.0 and last_eval_ber < 0.20:
-                current_phase = 3
-                phase2b_start = epoch
-                print(f"\n{'!'*60}")
-                print(f"  [PHASE TRANSITION] Entering Phase 2b (Quality Ramp) at epoch {epoch}.")
-                print(f"{'!'*60}")
-
-        if current_phase == 3:
-            # Phase 2b: quality ramp over 8 epochs
-            p = min(1.0, (epoch - phase2b_start) / 8.0)
-            
-            # THE FIX: Smoothly shrink the scale from 0.30 down to target (0.03) as quality losses ramp up
-            current_scale = 0.30 - ((0.30 - target_encoder_scale) * p)
-            trainer.encoder.encoder_scale    = current_scale
-            
-            trainer.aug_prob                 = 1.0
-            trainer.criterion.W_L1           = lc['lambda_l1']          * p
-            trainer.criterion.W_LPIPS        = lc['lambda_lpips']        * p
-            trainer.criterion.W_SSIM         = lc['lambda_ssim']         * p
-            trainer.criterion.W_ID           = lc['lambda_id']           * p
-            trainer.criterion.W_BIT_BENIGN   = 20.0
-            trainer.criterion.W_BIT_FRAGILE  = lc['lambda_bit_fragile']  * p
-            trainer.criterion.W_DISC         = lc['lambda_disc']         * p
-            trainer.criterion.W_ADV          = 0.0
-            phase = f"PHASE 2b: QUALITY RAMP (p={p:.0%}, scale={current_scale:.3f}, aug=100%)"
-
-            # Transition to Phase 3 after 9 epochs of Phase 2b
-            if phase2b_start is not None and (epoch - phase2b_start) >= 9:
-                current_phase = 4
-                phase3_start = epoch
-                best_score = -1.0   # RESET for full arms race scoring
-                no_improve_count = 0
-                print(f"\n{'!'*60}")
-                print(f"  [PHASE TRANSITION] Entering Phase 3 (Arms Race) at epoch {epoch}.")
-                print(f"{'!'*60}")
-
-        if current_phase == 4:
-            # Phase 3: Full arms race
-            trainer.encoder.encoder_scale    = target_encoder_scale
-            trainer.aug_prob                 = 1.0
-            trainer.criterion.W_L1           = lc['lambda_l1']
-            trainer.criterion.W_LPIPS        = lc['lambda_lpips']
-            trainer.criterion.W_SSIM         = lc['lambda_ssim']
-            trainer.criterion.W_ID           = lc['lambda_id']
-            trainer.criterion.W_BIT_BENIGN   = lc['lambda_bit_benign']
-            trainer.criterion.W_BIT_FRAGILE  = lc['lambda_bit_fragile']
-            trainer.criterion.W_DISC         = lc['lambda_disc']
-            trainer.criterion.W_ADV          = lc['lambda_adv']
-            phase = f"PHASE 3: ARMS RACE (scale={target_encoder_scale})"
+        
+        # Set all weights to their active values (from config)
+        trainer.encoder.encoder_scale    = config['model_config'].get('encoder_scale', 1.0)
+        trainer.aug_prob                 = 0.5  # Reduced to 0.5 to stabilize signal acquisition
+        trainer.criterion.W_L1           = config['loss_config']['lambda_l1']
+        trainer.criterion.W_LPIPS        = config['loss_config']['lambda_lpips']
+        trainer.criterion.W_SSIM         = config['loss_config']['lambda_ssim']
+        trainer.criterion.W_ID           = config['loss_config']['lambda_id']
+        trainer.criterion.W_BIT_BENIGN   = config['loss_config']['lambda_bit_benign']
+        trainer.criterion.W_BIT_FRAGILE  = config['loss_config']['lambda_bit_fragile']  # L_RE loss weight
+        trainer.criterion.W_DISC         = config['loss_config']['lambda_disc']
+        trainer.criterion.W_ADV          = config['loss_config']['lambda_adv']
+        
+        phase = f"HYBRID DOMAIN: All losses active (L_RE semi-fragile loss)"
 
         print(f"\n{'-'*60}")
-        print(f"[*] {phase} | Epoch {epoch}")
+        print(f"[*] {phase} | Epoch {epoch}/{epochs}")
         print(f"{'-'*60}")
         
         trainer.train_epoch(epoch)
@@ -266,27 +169,33 @@ def main():
             if trainer.criterion.W_ADV > 0:
                 trainer.scheduler_adv.step(ber_benign)
 
-            # --- UNIFIED SCORING: works correctly across all phases ---
-            # Phase 1/2a: BER-only (PSNR can still be negative)
-            # Phase 2b/3:  Full QoS = BER accuracy x PSNR quality
-            if current_phase <= 2:
-                current_score = 1.0 - ber_benign   # Higher = better BER
-            else:
-                safe_psnr = max(psnr, 0.0)
-                current_score = (1.0 - ber_benign) * (safe_psnr / 40.0)
+            # --- HYBRID DOMAIN SCORING: All networks active from start ---
+            # Goal: Maximize robustness (benign BER) while maintaining imperceptibility (PSNR/SSIM)
+            # Score: (1 - benign_BER) * (PSNR/48), where 48dB is typical baseline
+            baseline_psnr = 48.0
+            current_score = (1.0 - ber_benign) * (psnr / baseline_psnr)
             
             # Checkpointing
             if current_score > best_score:
-                print(f"  [++] New best! Score {best_score:.4f} -> {current_score:.4f}")
-                print(f"       BER: {ber_benign*100:.2f}% | PSNR: {psnr:.2f}dB")
+                print(f"\n{'+'*60}")
+                print(f"  [BEST] New best score! {best_score:.4f} -> {current_score:.4f}")
+                print(f"  Benign BER: {ber_benign*100:.1f}% | Malign BER: {ber_attacked*100:.1f}%")
+                print(f"  PSNR: {psnr:.2f}dB | SSIM: {ssim:.4f} | LPIPS: {lpips:.4f}")
+                print(f"{'+'*60}\n")
                 best_score = current_score
                 no_improve_count = 0
                 trainer.save_checkpoint('best_weights')
             else:
                 no_improve_count += 1
-                print(f"  [--] No improvement ({no_improve_count}/{patience}). Best: {best_score:.4f}")
+                print(f"\n{'-'*60}")
+                print(f"  [NO IMPROVE] ({no_improve_count}/{patience}) | Best Score: {best_score:.4f}")
+                print(f"  Current: BER={ber_benign*100:.1f}% | PSNR={psnr:.2f}dB")
+                print(f"{'-'*60}\n")
                 if no_improve_count >= patience:
-                    print(f"\n[!] Early stopping at epoch {epoch}. Best Score: {best_score:.4f}")
+                    print(f"\n{'!'*60}")
+                    print(f"[EARLY STOPPING] No improvement for {patience} epochs at Epoch {epoch}.")
+                    print(f"[FINAL BEST SCORE] {best_score:.4f}")
+                    print(f"{'!'*60}")
                     break
 
 if __name__ == "__main__":
